@@ -1,0 +1,12 @@
+# Assessment folder
+assessment/
+
+# Backup folder
+backup/
+
+# Script files to ignore
+run.bat
+read.py
+dashboard.py
+analyze.py
+
