@@ -17,9 +17,9 @@ st.markdown(
     """
 <style>
 :root{
-  --card-bg: rgba(17,24,39,.60);  /* slate-900 */
-  --card-bd: rgba(148,163,184,.18); /* slate-400 */
-  --card-tx: rgba(226,232,240,.92); /* slate-200 */
+  --card-bg: rgba(17,24,39,.60);
+  --card-bd: rgba(148,163,184,.18);
+  --card-tx: rgba(226,232,240,.92);
   --card-sub: rgba(148,163,184,.92);
   --shadow: 0 10px 30px rgba(0,0,0,.25);
 }
@@ -129,6 +129,12 @@ STATE_CODE_TO_NAME = {
     "DC": "District of Columbia"
 }
 
+# =========================================================
+# Severity ORDER (FIX LEGEND ORDER)
+# =========================================================
+SEV_ORDER = ["Low", "Medium", "High", "Very High"]
+SEV_CAT = pd.CategoricalDtype(categories=SEV_ORDER, ordered=True)
+
 # =========================
 # Helpers
 # =========================
@@ -137,12 +143,10 @@ def norm_path(s: str) -> str:
         return ""
     return s.strip().strip('"').strip("'")
 
-
 def ensure_child_folder(base: str, child: str) -> str:
     base = norm_path(base)
     cand = os.path.join(base, child)
     return cand if os.path.isdir(cand) else base
-
 
 def read_spark_csv_folder(folder_path: str) -> pd.DataFrame:
     """Spark CSV output folder: part-*.csv + _SUCCESS (+ .crc)."""
@@ -156,20 +160,17 @@ def read_spark_csv_folder(folder_path: str) -> pd.DataFrame:
     files = sorted(files)
     return pd.read_csv(files[0])
 
-
 def safe_int_series(s):
     try:
         return pd.to_numeric(s, errors="coerce").astype("Int64")
     except:
         return s
 
-
 def safe_float_series(s):
     try:
         return pd.to_numeric(s, errors="coerce")
     except:
         return s
-
 
 def pick_col(df: pd.DataFrame, candidates):
     if df is None or df.empty:
@@ -180,12 +181,10 @@ def pick_col(df: pd.DataFrame, candidates):
             return m[c.lower()]
     return None
 
-
 def to_numeric(df: pd.DataFrame, col: str):
     if col and col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
-
 
 def drop_if_exists(df: pd.DataFrame, cols):
     if df is None or df.empty:
@@ -193,21 +192,39 @@ def drop_if_exists(df: pd.DataFrame, cols):
     exist = [c for c in cols if c in df.columns]
     return df.drop(columns=exist) if exist else df
 
-
 def severity_label_en(x):
+    """
+    normalize severity -> label with ORDERED categorical
+    accepts 1..4 or already strings
+    """
     try:
         xi = int(float(x))
+        mapping = {1: "Low", 2: "Medium", 3: "High", 4: "Very High"}
+        lab = mapping.get(xi, str(x))
     except:
-        return str(x)
-    mapping = {1: "Low", 2: "Medium", 3: "High", 4: "Very High"}
-    return mapping.get(xi, f"Level {xi}")
+        lab = str(x)
 
+    lab2 = lab.strip().lower()
+    if lab2 in ["low", "1"]:
+        out = "Low"
+    elif lab2 in ["medium", "med", "2"]:
+        out = "Medium"
+    elif lab2 in ["high", "3"]:
+        out = "High"
+    elif lab2 in ["very high", "very_high", "4", "veryhigh"]:
+        out = "Very High"
+    else:
+        out = lab
+    return out
+
+def enforce_sev_order(series: pd.Series) -> pd.Series:
+    s = series.astype(str).map(severity_label_en)
+    return s.astype(SEV_CAT)
 
 def clean_state_to_name(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip()
     up = s.str.upper()
     return up.map(STATE_CODE_TO_NAME).fillna(s)
-
 
 def pie_vega(df_counts: pd.DataFrame, label_col: str, value_col: str, title: str):
     if df_counts is None or df_counts.empty:
@@ -235,6 +252,70 @@ def pie_vega(df_counts: pd.DataFrame, label_col: str, value_col: str, title: str
     }
     st.vega_lite_chart(spec, use_container_width=True)
 
+def pivot_severity_table(df: pd.DataFrame, index_cols, sev_col: str, n_col: str):
+    """
+    Pivot to columns: Low, Medium, High, Very High (ordered).
+    index_cols: list[str] (existing cols)
+    """
+    if df is None or df.empty or not sev_col or not n_col:
+        return pd.DataFrame()
+
+    d = df.copy()
+    d[sev_col] = enforce_sev_order(d[sev_col])
+    d[n_col] = pd.to_numeric(d[n_col], errors="coerce").fillna(0)
+
+    idx = [c for c in index_cols if c and c in d.columns]
+    if not idx:
+        idx = []
+
+    piv = (
+        d.pivot_table(index=idx, columns=sev_col, values=n_col, aggfunc="sum", fill_value=0)
+        .reset_index()
+    )
+
+    for c in SEV_ORDER:
+        if c not in piv.columns:
+            piv[c] = 0
+
+    keep_front = idx
+    piv = piv[keep_front + SEV_ORDER]
+    return piv
+
+# =========================================================
+# NEW: Altair chart helper to FORCE legend order
+# =========================================================
+def altair_severity_line_chart(df: pd.DataFrame, x_col: str, sev_col: str, n_col: str, x_title: str):
+    """
+    Build a line chart with fixed legend order: Low->Medium->High->Very High.
+    """
+    d = df[[x_col, sev_col, n_col]].copy()
+    d[sev_col] = enforce_sev_order(d[sev_col])
+    d[n_col] = pd.to_numeric(d[n_col], errors="coerce").fillna(0)
+
+    # aggregate (just in case)
+    d = d.groupby([x_col, sev_col], as_index=False)[n_col].sum()
+
+    chart = (
+        alt.Chart(d)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X(f"{x_col}:O", title=x_title, sort=sorted(d[x_col].dropna().unique().tolist())),
+            y=alt.Y(f"{n_col}:Q", title="Cases"),
+            color=alt.Color(
+                f"{sev_col}:N",
+                title="Severity",
+                sort=SEV_ORDER,  # ✅ force legend order
+                legend=alt.Legend(orient="right"),
+            ),
+            tooltip=[
+                alt.Tooltip(x_col, title=x_title),
+                alt.Tooltip(sev_col, title="Severity"),
+                alt.Tooltip(n_col, title="Cases"),
+            ],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 # =========================
 # Load data once (ACTUAL + PRED)
@@ -262,7 +343,6 @@ GRAPH_EDGE_VIEWS = {
 }
 
 edges_full = pd.DataFrame()
-
 trend = pd.DataFrame()
 hotspots = pd.DataFrame()
 sev_weather = pd.DataFrame()
@@ -297,7 +377,6 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("Filters")
 
-# Cards per panel
 cards_per_panel = 3
 
 # Year
@@ -331,7 +410,6 @@ weather_sel = st.sidebar.multiselect("Weather Category", weather_opts, default=w
 topn_hotspots = 50
 topn_state_map = 20
 topn_edges = 50
-topn_hubs = 50
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Graph View")
@@ -368,7 +446,7 @@ def get_severity_col_for_mode(df: pd.DataFrame, severity_mode: str):
     return col, "Predicted Severity (Model)"
 
 # =========================================================
-# Sections (CHART FIRST, TABLE LATER)
+# Sections
 # =========================================================
 def render_trend(severity_mode: str):
     with st.expander("📈 Monthly Trend", expanded=True):
@@ -393,61 +471,64 @@ def render_trend(severity_mode: str):
         if n_col:
             df = to_numeric(df, n_col)
 
-        total_cases = int(df[n_col].fillna(0).sum()) if n_col else 0
+        tab1, tab2 = st.tabs(["📊 Summary & Charts", "📋 Detailed Breakdown"])
 
-        # Peak month (by total cases)
-        peak_month = "-"
-        if month_col and n_col and not df.empty:
-            agg = df.groupby(month_col, as_index=False)[n_col].sum().sort_values(n_col, ascending=False)
-            if not agg.empty:
-                peak_month = str(agg.iloc[0][month_col])
+        with tab1:
+            total_cases = int(df[n_col].fillna(0).sum()) if n_col else 0
 
-        # High severity share (if severity exists)
-        hi_share = "-"
-        if sev_col and n_col and not df.empty:
-            tmp = df[[sev_col, n_col]].copy()
-            tmp[sev_col] = pd.to_numeric(tmp[sev_col], errors="coerce")
-            tmp[n_col] = pd.to_numeric(tmp[n_col], errors="coerce").fillna(0)
-            total = tmp[n_col].sum()
-            if total > 0:
-                hi = tmp[tmp[sev_col] >= 3][n_col].sum()
-                hi_share = f"{(hi/total)*100:.1f}%"
+            peak_month = "-"
+            if month_col and n_col and not df.empty:
+                agg = df.groupby(month_col, as_index=False)[n_col].sum().sort_values(n_col, ascending=False)
+                if not agg.empty:
+                    peak_month = str(agg.iloc[0][month_col])
 
-        cards = [
-            {"title": "Total Cases", "value": f"{total_cases:,}", "subtitle": "After filters (year/state)", "icon": "🧾"},
-            {"title": "Peak Month", "value": peak_month, "subtitle": "Highest cases month", "icon": "📌"},
-            {"title": "High Severity Share", "value": hi_share, "subtitle": "Severity ≥ 3", "icon": "⚠️"},
-            {"title": "Mode", "value": ("Actual" if severity_mode=="ANALYTICS" else "Model"), "subtitle": sev_label, "icon": "🧠"},
-        ]
-        render_cards(cards, ncols=cards_per_panel)
+            hi_share = "-"
+            if sev_col and n_col and not df.empty:
+                tmp = df[[sev_col, n_col]].copy()
+                tmp[sev_col] = pd.to_numeric(tmp[sev_col], errors="coerce")
+                tmp[n_col] = pd.to_numeric(tmp[n_col], errors="coerce").fillna(0)
+                total = tmp[n_col].sum()
+                if total > 0:
+                    hi = tmp[tmp[sev_col] >= 3][n_col].sum()
+                    hi_share = f"{(hi/total)*100:.1f}%"
 
-        st.markdown("##### Charts")
-        if month_col and sev_col and n_col:
-            tmp = df[[month_col, sev_col, n_col]].copy()
-            tmp[sev_col] = tmp[sev_col].apply(severity_label_en)
-            piv = tmp.pivot_table(index=month_col, columns=sev_col, values=n_col, aggfunc="sum").fillna(0).sort_index()
-            st.caption("Cases by month (split by severity)")
-            st.line_chart(piv)
-        elif month_col and n_col:
-            agg = df.groupby(month_col, as_index=False)[n_col].sum().sort_values(month_col)
-            st.caption("Cases by month (total)")
-            st.line_chart(agg.set_index(month_col)[n_col])
-        else:
-            st.info("Need month + cases (n) columns to plot the trend.")
+            cards = [
+                {"title": "Total Cases", "value": f"{total_cases:,}", "subtitle": "After filters (year/state)", "icon": "🧾"},
+                {"title": "Peak Month", "value": peak_month, "subtitle": "Highest cases month", "icon": "📌"},
+                {"title": "High Severity Share", "value": hi_share, "subtitle": "Severity ≥ 3", "icon": "⚠️"},
+                {"title": "Mode", "value": ("Actual" if severity_mode=="ANALYTICS" else "Model"), "subtitle": sev_label, "icon": "🧠"},
+            ]
+            render_cards(cards, ncols=cards_per_panel)
 
-        st.markdown("##### Table")
-        show = df.copy()
-        if sev_col and sev_col in show.columns:
-            show[sev_col] = show[sev_col].apply(severity_label_en)
+            st.markdown("##### Charts")
+            if month_col and sev_col and n_col and not df.empty:
+                st.caption("Cases by month (split by severity) — legend order: Low → Medium → High → Very High")
+                # ✅ Altair = legend order fixed
+                altair_severity_line_chart(df, x_col=month_col, sev_col=sev_col, n_col=n_col, x_title="Month")
+            elif month_col and n_col and not df.empty:
+                agg = df.groupby(month_col, as_index=False)[n_col].sum().sort_values(month_col)
+                st.caption("Cases by month (total)")
+                st.line_chart(agg.set_index(month_col)[n_col])
+            else:
+                st.info("Need month + cases (n) columns to plot the trend.")
 
-        rename_map = {}
-        if year_col: rename_map[year_col] = "Year"
-        if month_col: rename_map[month_col] = "Month"
-        if sev_col: rename_map[sev_col] = sev_label
-        if n_col: rename_map[n_col] = "Cases"
-        if state_col: rename_map[state_col] = "State"
-        st.dataframe(show.rename(columns=rename_map), use_container_width=True, height=380)
-
+        with tab2:
+            st.markdown("##### Detailed Breakdown")
+            if month_col and sev_col and n_col and not df.empty:
+                tbl = pivot_severity_table(df, index_cols=[month_col], sev_col=sev_col, n_col=n_col)
+                tbl = tbl.rename(columns={month_col: "Month"})
+                st.dataframe(tbl, use_container_width=True, height=380)
+            else:
+                show = df.copy()
+                if sev_col and sev_col in show.columns:
+                    show[sev_col] = show[sev_col].apply(severity_label_en)
+                rename_map = {}
+                if year_col: rename_map[year_col] = "Year"
+                if month_col: rename_map[month_col] = "Month"
+                if sev_col: rename_map[sev_col] = sev_label
+                if n_col: rename_map[n_col] = "Cases"
+                if state_col: rename_map[state_col] = "State"
+                st.dataframe(show.rename(columns=rename_map), use_container_width=True, height=380)
 
 def render_hotspot(severity_mode: str):
     with st.expander("🔥 City Hotspots (Risk Priority)", expanded=True):
@@ -484,56 +565,61 @@ def render_hotspot(severity_mode: str):
         else:
             df_show = df.head(topn_hotspots)
 
-        top_city = str(df_show.iloc[0][city_col]) if (not df_show.empty and city_col) else "-"
-        total_cases = int(df[n_col].fillna(0).sum()) if n_col else 0
-        top_risk = "-"
-        if risk_col and not df_show.empty:
-            try:
-                top_risk = f"{float(df_show.iloc[0][risk_col]):,.1f}"
-            except:
-                top_risk = str(df_show.iloc[0][risk_col])
+        tab1, tab2 = st.tabs(["📊 Summary & Charts", "📋 Detailed Breakdown"])
 
-        avg_sev_overall = "-"
-        if avg_col and n_col and not df.empty:
-            # weighted avg severity
-            try:
-                w = (df[avg_col].fillna(0) * df[n_col].fillna(0)).sum()
-                s = df[n_col].fillna(0).sum()
-                if s > 0:
-                    avg_sev_overall = f"{(w/s):.2f}"
-            except:
-                pass
+        with tab1:
+            top_city = str(df_show.iloc[0][city_col]) if (not df_show.empty and city_col) else "-"
+            total_cases = int(df[n_col].fillna(0).sum()) if n_col else 0
 
-        cards = [
-            {"title": "Top City", "value": top_city, "subtitle": "Highest priority (risk)", "icon": "🏙️"},
-            {"title": "Total Cases", "value": f"{total_cases:,}", "subtitle": "After filters", "icon": "🧾"},
-            {"title": "Top Risk Score", "value": top_risk, "subtitle": "Cases × Avg Severity", "icon": "🔥"},
-            {"title": "Avg Severity", "value": avg_sev_overall, "subtitle": "Weighted average", "icon": "📊"},
-        ]
-        render_cards(cards, ncols=cards_per_panel)
+            top_risk = "-"
+            if risk_col and not df_show.empty:
+                try:
+                    top_risk = f"{float(df_show.iloc[0][risk_col]):,.1f}"
+                except:
+                    top_risk = str(df_show.iloc[0][risk_col])
 
-        st.caption(
-            "Risk Score explanation: **Risk Score = Cases × Average Severity**. "
-            "It prioritizes locations with both high volume and high severity."
-        )
+            avg_sev_overall = "-"
+            if avg_col and n_col and not df.empty:
+                try:
+                    w = (df[avg_col].fillna(0) * df[n_col].fillna(0)).sum()
+                    s = df[n_col].fillna(0).sum()
+                    if s > 0:
+                        avg_sev_overall = f"{(w/s):.2f}"
+                except:
+                    pass
 
-        st.markdown("##### Chart")
-        if city_col and n_col:
-            top_vol = df.groupby(city_col, as_index=False)[n_col].sum().sort_values(n_col, ascending=False).head(10)
-            top_vol = top_vol.rename(columns={city_col: "City", n_col: "Cases"}).set_index("City")
-            st.caption("Top 10 by Cases")
-            st.bar_chart(top_vol)
+            cards = [
+                {"title": "Top City", "value": top_city, "subtitle": "Highest priority (risk)", "icon": "🏙️"},
+                {"title": "Total Cases", "value": f"{total_cases:,}", "subtitle": "After filters", "icon": "🧾"},
+                {"title": "Top Risk Score", "value": top_risk, "subtitle": "Cases × Avg Severity", "icon": "🔥"},
+                {"title": "Avg Severity", "value": avg_sev_overall, "subtitle": "Weighted average", "icon": "📊"},
+            ]
+            render_cards(cards, ncols=cards_per_panel)
 
-        st.markdown("##### Table")
-        rename_map = {}
-        if city_col: rename_map[city_col] = "City"
-        if state_col: rename_map[state_col] = "State"
-        if year_col: rename_map[year_col] = "Year"
-        if n_col: rename_map[n_col] = "Cases"
-        if avg_col: rename_map[avg_col] = "Avg Severity"
-        if risk_col: rename_map[risk_col] = "Risk Score (Cases × Avg Severity)"
-        st.dataframe(df_show.rename(columns=rename_map), use_container_width=True, height=380)
+            st.caption(
+                "Risk Score explanation: **Risk Score = Cases × Average Severity**. "
+                "It prioritizes locations with both high volume and high severity."
+            )
 
+            st.markdown("##### Chart")
+            if city_col and n_col and not df.empty:
+                top_vol = df.groupby(city_col, as_index=False)[n_col].sum().sort_values(n_col, ascending=False).head(10)
+                top_vol = top_vol.rename(columns={city_col: "City", n_col: "Cases"}).set_index("City")
+                st.caption("Top 10 by Cases")
+                st.bar_chart(top_vol)
+            else:
+                st.info("Need City + Cases (n).")
+
+        with tab2:
+            st.markdown("##### Detailed Breakdown")
+            rename_map = {}
+            if city_col: rename_map[city_col] = "City"
+            if state_col: rename_map[state_col] = "State"
+            if year_col: rename_map[year_col] = "Year"
+            if n_col: rename_map[n_col] = "Cases"
+            if avg_col: rename_map[avg_col] = "Avg Severity"
+            if risk_col: rename_map[risk_col] = "Risk Score (Cases × Avg Severity)"
+            st.dataframe(df_show.rename(columns=rename_map), use_container_width=True, height=380)
 
 def render_weather(severity_mode: str):
     with st.expander("🌦️ Weather Drivers", expanded=True):
@@ -561,78 +647,83 @@ def render_weather(severity_mode: str):
         if n_col:
             df = to_numeric(df, n_col)
 
-        total_cases = int(df[n_col].fillna(0).sum()) if n_col else 0
-        n_buckets = int(df[bucket_col].nunique()) if bucket_col and not df.empty else 0
+        tab1, tab2 = st.tabs(["📊 Summary & Charts", "📋 Detailed Breakdown"])
 
-        # top weather by volume
-        top_weather = "-"
-        if bucket_col and n_col and not df.empty:
-            agg = df.groupby(bucket_col, as_index=False)[n_col].sum().sort_values(n_col, ascending=False)
-            if not agg.empty:
-                top_weather = str(agg.iloc[0][bucket_col])
+        with tab1:
+            total_cases = int(df[n_col].fillna(0).sum()) if n_col else 0
+            n_buckets = int(df[bucket_col].nunique()) if bucket_col and not df.empty else 0
 
-        # high severity share overall (>=3)
-        hi_share = "-"
-        if sev_col and n_col and not df.empty:
-            tmp = df[[sev_col, n_col]].copy()
-            tmp[sev_col] = pd.to_numeric(tmp[sev_col], errors="coerce")
-            tmp[n_col] = pd.to_numeric(tmp[n_col], errors="coerce").fillna(0)
-            total = tmp[n_col].sum()
-            if total > 0:
-                hi = tmp[tmp[sev_col] >= 3][n_col].sum()
-                hi_share = f"{(hi/total)*100:.1f}%"
+            top_weather = "-"
+            if bucket_col and n_col and not df.empty:
+                agg = df.groupby(bucket_col, as_index=False)[n_col].sum().sort_values(n_col, ascending=False)
+                if not agg.empty:
+                    top_weather = str(agg.iloc[0][bucket_col])
 
-        cards = [
-            {"title": "Total Cases", "value": f"{total_cases:,}", "subtitle": "After filters", "icon": "🧾"},
-            {"title": "Weather Buckets", "value": f"{n_buckets:,}", "subtitle": "Unique categories", "icon": "🗂️"},
-            {"title": "Top Weather", "value": top_weather, "subtitle": "Highest volume", "icon": "🌧️"},
-            {"title": "High Severity Share", "value": hi_share, "subtitle": "Severity ≥ 3", "icon": "⚠️"},
-        ]
-        render_cards(cards, ncols=cards_per_panel)
-
-        st.markdown("##### Charts")
-        c1, c2 = st.columns(2)
-
-        with c1:
-            if bucket_col and sev_col and n_col:
-                tmp = df[[bucket_col, sev_col, n_col]].copy()
+            hi_share = "-"
+            if sev_col and n_col and not df.empty:
+                tmp = df[[sev_col, n_col]].copy()
                 tmp[sev_col] = pd.to_numeric(tmp[sev_col], errors="coerce")
-                total = tmp.groupby(bucket_col, as_index=False)[n_col].sum().rename(columns={n_col: "total_n"})
-                hi = tmp[tmp[sev_col] >= 3].groupby(bucket_col, as_index=False)[n_col].sum().rename(columns={n_col: "hi_n"})
-                merged = total.merge(hi, on=bucket_col, how="left").fillna(0)
-                merged["high_sev_share_pct"] = (merged["hi_n"] / merged["total_n"].replace(0, pd.NA)) * 100
-                merged = merged.dropna(subset=["high_sev_share_pct"]).sort_values("high_sev_share_pct", ascending=False).head(12)
-                st.caption("Share of High Severity (≥3) by Weather")
-                st.bar_chart(merged.set_index(bucket_col)["high_sev_share_pct"])
+                tmp[n_col] = pd.to_numeric(tmp[n_col], errors="coerce").fillna(0)
+                total = tmp[n_col].sum()
+                if total > 0:
+                    hi = tmp[tmp[sev_col] >= 3][n_col].sum()
+                    hi_share = f"{(hi/total)*100:.1f}%"
+
+            cards = [
+                {"title": "Total Cases", "value": f"{total_cases:,}", "subtitle": "After filters", "icon": "🧾"},
+                {"title": "Weather Buckets", "value": f"{n_buckets:,}", "subtitle": "Unique categories", "icon": "🗂️"},
+                {"title": "Top Weather", "value": top_weather, "subtitle": "Highest volume", "icon": "🌧️"},
+                {"title": "High Severity Share", "value": hi_share, "subtitle": "Severity ≥ 3", "icon": "⚠️"},
+            ]
+            render_cards(cards, ncols=cards_per_panel)
+
+            st.markdown("##### Charts")
+            c1, c2 = st.columns(2)
+
+            with c1:
+                if bucket_col and sev_col and n_col and not df.empty:
+                    tmp = df[[bucket_col, sev_col, n_col]].copy()
+                    tmp[sev_col] = pd.to_numeric(tmp[sev_col], errors="coerce")
+                    total = tmp.groupby(bucket_col, as_index=False)[n_col].sum().rename(columns={n_col: "total_n"})
+                    hi = tmp[tmp[sev_col] >= 3].groupby(bucket_col, as_index=False)[n_col].sum().rename(columns={n_col: "hi_n"})
+                    merged = total.merge(hi, on=bucket_col, how="left").fillna(0)
+                    merged["high_sev_share_pct"] = (merged["hi_n"] / merged["total_n"].replace(0, pd.NA)) * 100
+                    merged = merged.dropna(subset=["high_sev_share_pct"]).sort_values("high_sev_share_pct", ascending=False).head(12)
+                    st.caption("Share of High Severity (≥3) by Weather")
+                    st.bar_chart(merged.set_index(bucket_col)["high_sev_share_pct"])
+                else:
+                    st.info("Need weather_bucket + severity + cases (n).")
+
+            with c2:
+                if bucket_col and n_col and not df.empty:
+                    vol = (
+                        df.groupby(bucket_col, as_index=False)[n_col]
+                          .sum()
+                          .sort_values(n_col, ascending=False)
+                          .head(8)
+                          .rename(columns={bucket_col: "Weather", n_col: "Cases"})
+                    )
+                    pie_vega(vol, "Weather", "Cases", "Volume by Weather (Top 8)")
+                else:
+                    st.info("Need weather_bucket + cases (n).")
+
+        with tab2:
+            st.markdown("##### Detailed Breakdown (Pivot Severity Columns)")
+            if bucket_col and sev_col and n_col and not df.empty:
+                tbl = pivot_severity_table(df, index_cols=[bucket_col], sev_col=sev_col, n_col=n_col)
+                tbl = tbl.rename(columns={bucket_col: "Weather Category"})
+                st.dataframe(tbl, use_container_width=True, height=380)
             else:
-                st.info("Need weather_bucket + severity + cases (n).")
-
-        with c2:
-            if bucket_col and n_col:
-                vol = (
-                    df.groupby(bucket_col, as_index=False)[n_col]
-                      .sum()
-                      .sort_values(n_col, ascending=False)
-                      .head(8)
-                      .rename(columns={bucket_col: "Weather", n_col: "Cases"})
-                )
-                pie_vega(vol, "Weather", "Cases", "Volume by Weather (Top 8)")
-            else:
-                st.info("Need weather_bucket + cases (n).")
-
-        st.markdown("##### Table")
-        show = df.copy()
-        if sev_col and sev_col in show.columns:
-            show[sev_col] = show[sev_col].apply(severity_label_en)
-
-        rename_map = {}
-        if bucket_col: rename_map[bucket_col] = "Weather Category"
-        if sev_col: rename_map[sev_col] = sev_label
-        if n_col: rename_map[n_col] = "Cases"
-        if year_col: rename_map[year_col] = "Year"
-        if state_col: rename_map[state_col] = "State"
-        st.dataframe(show.rename(columns=rename_map), use_container_width=True, height=380)
-
+                show = df.copy()
+                if sev_col and sev_col in show.columns:
+                    show[sev_col] = show[sev_col].apply(severity_label_en)
+                rename_map = {}
+                if bucket_col: rename_map[bucket_col] = "Weather Category"
+                if sev_col: rename_map[sev_col] = sev_label
+                if n_col: rename_map[n_col] = "Cases"
+                if year_col: rename_map[year_col] = "Year"
+                if state_col: rename_map[state_col] = "State"
+                st.dataframe(show.rename(columns=rename_map), use_container_width=True, height=380)
 
 def render_hour(severity_mode: str):
     with st.expander("🕒 Time Drivers (Hour of Day)", expanded=True):
@@ -663,60 +754,65 @@ def render_hour(severity_mode: str):
         if n_col:
             df = to_numeric(df, n_col)
 
-        total = int(df[n_col].fillna(0).sum()) if n_col else 0
+        tab1, tab2 = st.tabs(["📊 Summary & Charts", "📋 Detailed Breakdown"])
 
-        peak_hour = "-"
-        if hour_col and n_col and not df.empty:
-            agg = df.groupby(hour_col, as_index=False)[n_col].sum().sort_values(n_col, ascending=False)
-            if not agg.empty:
-                peak_hour = str(agg.iloc[0][hour_col])
+        with tab1:
+            total = int(df[n_col].fillna(0).sum()) if n_col else 0
 
-        hi_share = "-"
-        if sev_col and n_col and not df.empty:
-            tmp = df[[sev_col, n_col]].copy()
-            tmp[sev_col] = pd.to_numeric(tmp[sev_col], errors="coerce")
-            tmp[n_col] = pd.to_numeric(tmp[n_col], errors="coerce").fillna(0)
-            total_n = tmp[n_col].sum()
-            if total_n > 0:
-                hi = tmp[tmp[sev_col] >= 3][n_col].sum()
-                hi_share = f"{(hi/total_n)*100:.1f}%"
+            peak_hour = "-"
+            if hour_col and n_col and not df.empty:
+                agg = df.groupby(hour_col, as_index=False)[n_col].sum().sort_values(n_col, ascending=False)
+                if not agg.empty:
+                    peak_hour = str(agg.iloc[0][hour_col])
 
-        cards = [
-            {"title": "Total Cases", "value": f"{total:,}", "subtitle": "After filters", "icon": "🧾"},
-            {"title": "Peak Hour", "value": peak_hour, "subtitle": "Highest volume hour", "icon": "⏱️"},
-            {"title": "High Severity Share", "value": hi_share, "subtitle": "Severity ≥ 3", "icon": "⚠️"},
-            {"title": "Mode", "value": ("Actual" if severity_mode=="ANALYTICS" else "Model"), "subtitle": sev_label, "icon": "🧠"},
-        ]
-        render_cards(cards, ncols=cards_per_panel)
+            hi_share = "-"
+            if sev_col and n_col and not df.empty:
+                tmp = df[[sev_col, n_col]].copy()
+                tmp[sev_col] = pd.to_numeric(tmp[sev_col], errors="coerce")
+                tmp[n_col] = pd.to_numeric(tmp[n_col], errors="coerce").fillna(0)
+                total_n = tmp[n_col].sum()
+                if total_n > 0:
+                    hi = tmp[tmp[sev_col] >= 3][n_col].sum()
+                    hi_share = f"{(hi/total_n)*100:.1f}%"
 
-        st.markdown("##### Chart")
-        if hour_col and sev_col and n_col:
-            tmp = df[[hour_col, sev_col, n_col]].copy()
-            tmp[sev_col] = tmp[sev_col].apply(severity_label_en)
-            piv = tmp.pivot_table(index=hour_col, columns=sev_col, values=n_col, aggfunc="sum").fillna(0).sort_index()
-            st.caption("Hourly pattern (cases) by severity")
-            st.line_chart(piv)
-        elif hour_col and n_col:
-            agg = df.groupby(hour_col, as_index=False)[n_col].sum().sort_values(hour_col)
-            st.caption("Hourly pattern (total cases)")
-            st.line_chart(agg.set_index(hour_col)[n_col])
-        else:
-            st.info("Need hour + cases (n) to plot.")
+            cards = [
+                {"title": "Total Cases", "value": f"{total:,}", "subtitle": "After filters", "icon": "🧾"},
+                {"title": "Peak Hour", "value": peak_hour, "subtitle": "Highest volume hour", "icon": "⏱️"},
+                {"title": "High Severity Share", "value": hi_share, "subtitle": "Severity ≥ 3", "icon": "⚠️"},
+                {"title": "Mode", "value": ("Actual" if severity_mode=="ANALYTICS" else "Model"), "subtitle": sev_label, "icon": "🧠"},
+            ]
+            render_cards(cards, ncols=cards_per_panel)
 
-        st.markdown("##### Table")
-        show = df.copy()
-        if sev_col and sev_col in show.columns:
-            show[sev_col] = show[sev_col].apply(severity_label_en)
+            st.markdown("##### Chart")
+            if hour_col and sev_col and n_col and not df.empty:
+                st.caption("Hourly pattern (cases) by severity — legend order: Low → Medium → High → Very High")
+                # ✅ Altair = legend order fixed
+                altair_severity_line_chart(df, x_col=hour_col, sev_col=sev_col, n_col=n_col, x_title="Hour (0–23)")
+            elif hour_col and n_col and not df.empty:
+                agg = df.groupby(hour_col, as_index=False)[n_col].sum().sort_values(hour_col)
+                st.caption("Hourly pattern (total cases)")
+                st.line_chart(agg.set_index(hour_col)[n_col])
+            else:
+                st.info("Need hour + cases (n) to plot.")
 
-        rename_map = {}
-        if hour_col: rename_map[hour_col] = "Hour"
-        if sev_col: rename_map[sev_col] = sev_label
-        if n_col: rename_map[n_col] = "Cases"
-        if year_col: rename_map[year_col] = "Year"
-        if state_col: rename_map[state_col] = "State"
-        if bucket_col: rename_map[bucket_col] = "Weather Category"
-        st.dataframe(show.rename(columns=rename_map), use_container_width=True, height=380)
-
+        with tab2:
+            st.markdown("##### Detailed Breakdown (Pivot Severity Columns)")
+            if hour_col and sev_col and n_col and not df.empty:
+                tbl = pivot_severity_table(df, index_cols=[hour_col], sev_col=sev_col, n_col=n_col)
+                tbl = tbl.rename(columns={hour_col: "Hour"})
+                st.dataframe(tbl, use_container_width=True, height=380)
+            else:
+                show = df.copy()
+                if sev_col and sev_col in show.columns:
+                    show[sev_col] = show[sev_col].apply(severity_label_en)
+                rename_map = {}
+                if hour_col: rename_map[hour_col] = "Hour"
+                if sev_col: rename_map[sev_col] = sev_label
+                if n_col: rename_map[n_col] = "Cases"
+                if year_col: rename_map[year_col] = "Year"
+                if state_col: rename_map[state_col] = "State"
+                if bucket_col: rename_map[bucket_col] = "Weather Category"
+                st.dataframe(show.rename(columns=rename_map), use_container_width=True, height=380)
 
 def render_map():
     with st.expander("🗺️ Map (Top States by Cases)", expanded=True):
@@ -765,79 +861,82 @@ def render_map():
             st.warning("State-to-lat/lon join failed.")
             return
 
-        # cards
-        top_state = str(mapdf.iloc[0]["StateName"]) if not mapdf.empty else "-"
-        top_cases = f"{int(mapdf.iloc[0]['Cases']):,}" if not mapdf.empty else "-"
-        covered = f"{len(mapdf):,}/{len(STATE_MAP_DF):,}"
+        tab1, tab2 = st.tabs(["📊 Summary & Charts", "📋 Detailed Breakdown"])
 
-        cards = [
-            {"title": "Top State", "value": top_state, "subtitle": "Highest cases (in map view)", "icon": "🏁"},
-            {"title": "Top Cases", "value": top_cases, "subtitle": "Cases in top state", "icon": "🧾"},
-            {"title": "States Shown", "value": covered, "subtitle": "Joined with lat/lon", "icon": "🗺️"},
-            {"title": "Map View", "value": "Scatter", "subtitle": "Bubble size ~ sqrt(cases)", "icon": "🫧"},
-        ]
-        render_cards(cards, ncols=cards_per_panel)
+        with tab1:
+            top_state = str(mapdf.iloc[0]["StateName"]) if not mapdf.empty else "-"
+            top_cases = f"{int(mapdf.iloc[0]['Cases']):,}" if not mapdf.empty else "-"
+            covered = f"{len(mapdf):,}/{len(STATE_MAP_DF):,}"
 
-        mapdf["tooltip"] = mapdf["StateName"] + "\nCases: " + mapdf["Cases"].map(lambda x: f"{int(x):,}")
-        mapdf["radius"] = (mapdf["Cases"].clip(lower=0) ** 0.5)
+            cards = [
+                {"title": "Top State", "value": top_state, "subtitle": "Highest cases (in map view)", "icon": "🏁"},
+                {"title": "Top Cases", "value": top_cases, "subtitle": "Cases in top state", "icon": "🧾"},
+                {"title": "States Shown", "value": covered, "subtitle": "Joined with lat/lon", "icon": "🗺️"},
+                {"title": "Map View", "value": "Scatter", "subtitle": "Bubble size ~ sqrt(cases)", "icon": "🫧"},
+            ]
+            render_cards(cards, ncols=cards_per_panel)
 
-        picked_state = None
-        if state_sel and len(state_sel) == 1:
-            picked_state = STATE_CODE_TO_NAME.get(state_sel[0].upper(), state_sel[0])
+            mapdf["tooltip"] = mapdf["StateName"] + "\nCases: " + mapdf["Cases"].map(lambda x: f"{int(x):,}")
+            mapdf["radius"] = (mapdf["Cases"].clip(lower=0) ** 0.5)
 
-        base_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=mapdf,
-            get_position='[lon, lat]',
-            get_radius="radius",
-            radius_scale=120,
-            radius_min_pixels=4,
-            radius_max_pixels=40,
-            pickable=True,
-            auto_highlight=True,
-            get_fill_color=[80, 160, 255, 120],
-            get_line_color=[200, 200, 200, 160],
-            line_width_min_pixels=1,
-        )
+            picked_state = None
+            if state_sel and len(state_sel) == 1:
+                picked_state = STATE_CODE_TO_NAME.get(state_sel[0].upper(), state_sel[0])
 
-        layers = [base_layer]
+            base_layer = pdk.Layer(
+                "ScatterplotLayer",
+                data=mapdf,
+                get_position='[lon, lat]',
+                get_radius="radius",
+                radius_scale=120,
+                radius_min_pixels=4,
+                radius_max_pixels=40,
+                pickable=True,
+                auto_highlight=True,
+                get_fill_color=[80, 160, 255, 120],
+                get_line_color=[200, 200, 200, 160],
+                line_width_min_pixels=1,
+            )
 
-        if picked_state:
-            sel = mapdf[mapdf["StateName"] == picked_state].copy()
-            if not sel.empty:
-                layers.append(
-                    pdk.Layer(
-                        "ScatterplotLayer",
-                        data=sel,
-                        get_position='[lon, lat]',
-                        get_radius="radius",
-                        radius_scale=180,
-                        radius_min_pixels=10,
-                        radius_max_pixels=70,
-                        pickable=True,
-                        get_fill_color=[255, 90, 90, 180],
-                        get_line_color=[255, 255, 255, 220],
-                        line_width_min_pixels=2,
+            layers = [base_layer]
+
+            if picked_state:
+                sel = mapdf[mapdf["StateName"] == picked_state].copy()
+                if not sel.empty:
+                    layers.append(
+                        pdk.Layer(
+                            "ScatterplotLayer",
+                            data=sel,
+                            get_position='[lon, lat]',
+                            get_radius="radius",
+                            radius_scale=180,
+                            radius_min_pixels=10,
+                            radius_max_pixels=70,
+                            pickable=True,
+                            get_fill_color=[255, 90, 90, 180],
+                            get_line_color=[255, 255, 255, 220],
+                            line_width_min_pixels=2,
+                        )
                     )
-                )
 
-        deck = pdk.Deck(
-            map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-            initial_view_state=pdk.ViewState(latitude=39.5, longitude=-98.35, zoom=3.2, pitch=0),
-            layers=layers,
-            tooltip={"text": "{tooltip}"},
-        )
+            deck = pdk.Deck(
+                map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                initial_view_state=pdk.ViewState(latitude=39.5, longitude=-98.35, zoom=3.2, pitch=0),
+                layers=layers,
+                tooltip={"text": "{tooltip}"},
+            )
 
-        st.markdown("##### Map")
-        st.pydeck_chart(deck, use_container_width=True)
+            st.markdown("##### Map")
+            st.pydeck_chart(deck, use_container_width=True)
 
-        st.markdown("##### State Ranking (Cases)")
-        view_tbl = mapdf[["StateName", "Cases"]].rename(columns={"StateName": "State"})
-        st.bar_chart(view_tbl.set_index("State")["Cases"])
+            st.markdown("##### State Ranking (Cases)")
+            view_tbl = mapdf[["StateName", "Cases"]].rename(columns={"StateName": "State"})
+            st.bar_chart(view_tbl.set_index("State")["Cases"])
 
-        st.markdown("##### Table")
-        st.dataframe(view_tbl, use_container_width=True, height=260)
-
+        with tab2:
+            st.markdown("##### Detailed Breakdown")
+            view_tbl = mapdf[["StateName", "Cases"]].rename(columns={"StateName": "State"})
+            st.dataframe(view_tbl, use_container_width=True, height=260)
 
 def heatmap_pair(
     df_edges: pd.DataFrame,
@@ -894,7 +993,6 @@ def heatmap_pair(
     )
     st.altair_chart(chart, use_container_width=True)
 
-
 def heatmap_city_hour(df_edges: pd.DataFrame, src_col: str, dst_col: str, w_col: str, top_cities: int = 15):
     if df_edges is None or df_edges.empty:
         st.info("No data for heatmap.")
@@ -938,7 +1036,6 @@ def heatmap_city_hour(df_edges: pd.DataFrame, src_col: str, dst_col: str, w_col:
     )
     st.altair_chart(chart, use_container_width=True)
 
-
 def render_graph():
     with st.expander("🕸️ Graph Insights (Connectivity)", expanded=True):
         if edges_full.empty:
@@ -946,7 +1043,6 @@ def render_graph():
             return
 
         e = drop_if_exists(edges_full.copy(), ["avg_conf", "Avg_conf", "AVG_CONF"])
-
         cols = {c.lower(): c for c in e.columns}
 
         def col(name):
@@ -985,70 +1081,71 @@ def render_graph():
 
         e_top = e.sort_values(w_col, ascending=False).head(topn_edges)
 
-        # Cards summary
-        n_edges = len(e_top)
-        strongest = "-"
-        if not e_top.empty:
-            try:
-                strongest = f"{float(e_top.iloc[0][w_col]):,.0f}"
-            except:
-                strongest = str(e_top.iloc[0][w_col])
+        tab1, tab2 = st.tabs(["📊 Summary & Charts", "📋 Detailed Breakdown"])
 
-        unique_src = int(e_top[src_col].nunique()) if src_col in e_top.columns else 0
-        unique_dst = int(e_top[dst_col].nunique()) if dst_col in e_top.columns else 0
+        with tab1:
+            n_edges = len(e_top)
+            strongest = "-"
+            if not e_top.empty:
+                try:
+                    strongest = f"{float(e_top.iloc[0][w_col]):,.0f}"
+                except:
+                    strongest = str(e_top.iloc[0][w_col])
 
-        cards = [
-            {"title": "Connectivity View", "value": graph_view, "subtitle": f"Folder: {edges_folder}", "icon": "🕸️"},
-            {"title": "Top Edges", "value": f"{n_edges:,}", "subtitle": "Shown after filters", "icon": "🔗"},
-            {"title": "Strongest Link", "value": strongest, "subtitle": "Max co-occurrence", "icon": "💪"},
-            {"title": "Coverage", "value": f"{unique_src:,}×{unique_dst:,}", "subtitle": "Unique src × dst", "icon": "📦"},
-        ]
-        render_cards(cards, ncols=cards_per_panel)
+            unique_src = int(e_top[src_col].nunique()) if src_col in e_top.columns else 0
+            unique_dst = int(e_top[dst_col].nunique()) if dst_col in e_top.columns else 0
 
-        st.caption(f"Connectivity view: **{graph_view}**.")
+            cards = [
+                {"title": "Connectivity View", "value": graph_view, "subtitle": f"Folder: {edges_folder}", "icon": "🕸️"},
+                {"title": "Top Edges", "value": f"{n_edges:,}", "subtitle": "Shown after filters", "icon": "🔗"},
+                {"title": "Strongest Link", "value": strongest, "subtitle": "Max co-occurrence", "icon": "💪"},
+                {"title": "Coverage", "value": f"{unique_src:,}×{unique_dst:,}", "subtitle": "Unique src × dst", "icon": "📦"},
+            ]
+            render_cards(cards, ncols=cards_per_panel)
 
-        # ===== Chart FIRST (Heatmap) =====
-        if ("City" in graph_view) and ("Hour" in graph_view):
-            st.markdown("##### Heatmap — City vs Hour (Co-occurrence)")
-            try:
-                heatmap_city_hour(e_top, src_col=src_col, dst_col=dst_col, w_col=w_col, top_cities=15)
-            except Exception as ex:
-                st.warning(f"Heatmap failed: {ex}")
-                st.info("Check that dst is numeric hour (0-23) and altair is installed.")
-        elif ("City" in graph_view) and ("Weather" in graph_view):
-            st.markdown("##### Heatmap — City vs Weather (Co-occurrence)")
-            try:
-                heatmap_pair(
-                    e_top,
-                    a_col=src_col,
-                    b_col=dst_col,
-                    w_col=w_col,
-                    top_a=15,
-                    top_b=10,
-                    a_title="City",
-                    b_title="Weather",
-                )
-            except Exception as ex:
-                st.warning(f"Heatmap failed: {ex}")
-        elif ("Hour" in graph_view) and ("Weather" in graph_view):
-            st.markdown("##### Heatmap — Hour vs Weather (Co-occurrence)")
-            try:
-                heatmap_pair(
-                    e_top,
-                    a_col=src_col,
-                    b_col=dst_col,
-                    w_col=w_col,
-                    top_a=24,
-                    top_b=10,
-                    a_title="Hour",
-                    b_title="Weather",
-                )
-            except Exception as ex:
-                st.warning(f"Heatmap failed: {ex}")
+            st.caption(f"Connectivity view: **{graph_view}**.")
 
-        st.markdown("##### Table — Top Edges (Strongest Connections)")
-        st.dataframe(e_top, use_container_width=True, height=280)
+            if ("City" in graph_view) and ("Hour" in graph_view):
+                st.markdown("##### Heatmap — City vs Hour (Co-occurrence)")
+                try:
+                    heatmap_city_hour(e_top, src_col=src_col, dst_col=dst_col, w_col=w_col, top_cities=15)
+                except Exception as ex:
+                    st.warning(f"Heatmap failed: {ex}")
+                    st.info("Check that dst is numeric hour (0-23) and altair is installed.")
+            elif ("City" in graph_view) and ("Weather" in graph_view):
+                st.markdown("##### Heatmap — City vs Weather (Co-occurrence)")
+                try:
+                    heatmap_pair(
+                        e_top,
+                        a_col=src_col,
+                        b_col=dst_col,
+                        w_col=w_col,
+                        top_a=15,
+                        top_b=10,
+                        a_title="City",
+                        b_title="Weather",
+                    )
+                except Exception as ex:
+                    st.warning(f"Heatmap failed: {ex}")
+            elif ("Hour" in graph_view) and ("Weather" in graph_view):
+                st.markdown("##### Heatmap — Hour vs Weather (Co-occurrence)")
+                try:
+                    heatmap_pair(
+                        e_top,
+                        a_col=src_col,
+                        b_col=dst_col,
+                        w_col=w_col,
+                        top_a=24,
+                        top_b=10,
+                        a_title="Hour",
+                        b_title="Weather",
+                    )
+                except Exception as ex:
+                    st.warning(f"Heatmap failed: {ex}")
 
+        with tab2:
+            st.markdown("##### Detailed Breakdown — Top Edges (Strongest Connections)")
+            st.dataframe(e_top, use_container_width=True, height=280)
 
 # =========================================================
 # PAGE
